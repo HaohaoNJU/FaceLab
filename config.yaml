@@ -22,7 +22,7 @@ classifier :
       s : 256.0
       m : 0.25 # circle loss kwargs
     # metric_kwargs : {"in_features":embedding_dim, "out_features":num_classes, "s":64, "m":0.5,} # arc_face kwargs
-    model_weight_path : "/home/wh/projects/Xlab/model_weights/model_0507/resnet50_circle_loss_xent_2020-05-07_metric_epoch12.pth"  # "/home/wh/projects/Xlab/work_space/resnet50_xbm_multi_similarity_loss_2020-05-14/model_weights/epoch20.pth"
+    model_weight_path : "/path/to/metric_weight.pth" 
     optimizer : "sgd"
     hypers :
       lr : 0.0003
@@ -59,7 +59,7 @@ batch_size : 24
 val_interval : 1
 
 epoch : 50
-start_epoch : 0 # specify which epoch to start, ignored in pretrained mode
+start_epoch : 0 # specify which epoch to start
 
 hypers :
   lr : 0.0005  # initial learning rate
@@ -76,7 +76,7 @@ lr_decay :
   "40" : [0.00002,0.00002]
 
 
-train_data : '/home/wh/train_data_wo_aug/datasets_miracle.pkl'
+train_data : '/path/to/train/images'
 dataset_loader : data_loaders.data_loader_pair.Data_Loader
 train_data_kwargs:
   p : 0.9
@@ -88,7 +88,7 @@ train_data_kwargs:
   pin_memory : True
 
 validate : False
-val_data : "/home/njfh/sdd/qiu_sdd/train_datasets/datasets_miracle"
+val_data : ""
 
 pretrained : True
 print_freq : 10  # print info every N batch
@@ -96,8 +96,8 @@ visualize : True # visualize or not
 vis_kwargs:
   hm_size : [18,15] # fig size of a heatmap
   emb_delay : 60  # amplifier behind print freq
-model_weight_path : '/home/mengzihan/FaceRecognition/FaceLabDev/model_weights/model_resnet50_mxnet.pth'
-save_path : "/home/mengzihan/FaceRecognition/FaceLabDev/work_space" # work path
+model_weight_path : '/path/to/backbone/weight'
+save_path : "./work_space" # work path
 
 
 
