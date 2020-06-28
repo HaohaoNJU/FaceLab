@@ -27,6 +27,7 @@ from utils import get_func, parse_args, separate_fc_params, init_func_and_tag
 from modules import IOFactory,OptimFactory,Header
 from torch.optim.lr_scheduler import StepLR
 from torch import distributed
+
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from apex import amp
@@ -47,6 +48,7 @@ class Solver(nn.Module):
         self.pairwise_learning = opt.pairwise_learning
         self.header_cfg = opt.pairwiser if opt.pairwise_learning else opt.classifier
 
+        self.local_rank = opt.local_rank
         self.use_gpu = opt.use_gpu
         self.gpu_ids = [int(x) for x in opt.gpu_ids.split(",")] if isinstance(opt.gpu_ids,str)\
             else [int(x) for x in opt.gpu_ids]
@@ -106,10 +108,6 @@ class Solver(nn.Module):
             vis=self.visualize,
             log_name="train"
         )
-        if self.dist_parallel:
-            distributed.init_process_group(
-                "nccl", init_method="env://"
-            )
 
     def build_model(self):
         # data loader init
@@ -143,17 +141,23 @@ class Solver(nn.Module):
         if not torch.cuda.is_available() or not self.use_gpu:
             self.net = self.net.cpu()
             self.device = torch.device("cpu")
-        else:
+
+        elif self.dist_parallel:
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            self.net = self.net.to(self.device)
+            self.header.to(self.device)
+            self.net = convert_syncbn_model(self.net)
+            self.net = DistributedDataParallel(self.net,delay_allreduce=True)
+            self.header.dist_parallel()
+        elif len(self.gpu_ids) > 1:
             self.device = torch.device("cuda:{}".format(self.gpu_ids[0]))
             self.net = self.net.to(self.device)
             self.header.to(self.device)
-            if len(self.gpu_ids) > 1 and self.dist_parallel:
-                self.net = convert_syncbn_model(self.net)
-                self.net = DistributedDataParallel(self.net,delay_allreduce=True)
-                self.header.dist_parallel()
-            elif len(self.gpu_ids) > 1:
-                self.net = nn.DataParallel(self.net,device_ids=self.gpu_ids)
-                self.header.parallel(self.gpu_ids)
+            self.net = nn.DataParallel(self.net, device_ids=self.gpu_ids)
+            self.header.parallel(self.gpu_ids)
+        else:
+            self.net = nn.DataParallel(self.net,device_ids=self.gpu_ids)
+            self.header.parallel(self.gpu_ids)
 
     def heatmapper(self,embeddings=None,labels=None,steps=None):
         with torch.no_grad():
@@ -241,7 +245,24 @@ class Solver(nn.Module):
     def val(self):
         pass # Online validation is to be added !
 
+def main_worker(gpu, ngpus_per_node, opt):
+
+    print("Use GPU: {} for training".format(gpu))
+    # For multiprocessing distributed training, rank needs to be the
+    # global rank among all the processes
+    # dist init
+
+    opt.local_rank = opt.local_rank * ngpus_per_node + gpu
+    distributed.init_process_group(
+            "nccl", init_method="env://",world_size=ngpus_per_node,rank=opt.local_rank
+        )
+    # mpu.initialize_model_parallel(args.model_parallel_size)
+
+    solver = Solver(opt)
+    solver.train()
+
 if __name__ == "__main__":
+    # https://zhuanlan.zhihu.com/p/76638962
     # get config
     from easydict import EasyDict
     import yaml
@@ -249,9 +270,21 @@ if __name__ == "__main__":
     # opt = args.cfg[:-3] if args.cfg.endswith("py") else args.cfg
     # opt = get_func(opt)
     opt = EasyDict(yaml.load(open(args.cfg,"r"),Loader = yaml.Loader))
+    opt.local_rank = args.local_rank
+    print("local rank: ",opt.local_rank)
     # specify gpus to use
-    # os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_ids
+    os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_ids
     # initialize and run up !
     solver = Solver(opt)
     solver.train()
+
+
+
+
+
+
+
+
+
+
 
