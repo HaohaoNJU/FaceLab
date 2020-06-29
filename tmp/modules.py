@@ -46,6 +46,7 @@ class Header(nn.Module):
                  net_tag = "resnet50",
                  embedding_dim = 256,
                  num_classes = 1000,
+                 local_rank = None,
                  config = None):
         super(Header,self).__init__()
         self.pairwise = pairwise
@@ -58,6 +59,7 @@ class Header(nn.Module):
         self.tag = net_tag
         self.embedding_dim = embedding_dim
         self.num_classes = num_classes
+        self.local_rank = local_rank
         # initialize
         if pairwise:
             self.pairwiser_init(config)
@@ -75,7 +77,25 @@ class Header(nn.Module):
     def to(self,device):
         self.modules = [module.to(device) for module in self.modules if module]
     def dist_parallel(self):
-        self.modules = [DistributedDataParallel(module,delay_allreduce=True) for module in self.modules if module]
+        modules = []
+        tic = 0
+        for module in self.modules:
+            try:
+                module = torch.nn.parallel.DistributedDataParallel(module,
+                                                                  device_ids=[self.local_rank],
+                                                                  output_device=self.local_rank
+                                                                  )
+                modules.append(module)
+                tic += 1
+            except Exception as e:
+                modules.append(module)
+        if tic==0: print("Warning: No module in header has been implemented with dist parallel !")
+        self.modules = modules
+
+        # self.modules = [torch.nn.parallel.DistributedDataParallel(module,
+        #                                                           device_ids=[self.local_rank],
+        #                                                           output_device=self.local_rank
+        #                                                           ) for module in self.modules if module]
     def parallel(self,gpu_ids):
         self.modules = [nn.DataParallel(module, device_ids = gpu_ids) for module in self.modules if module]
 
@@ -125,7 +145,6 @@ class Header(nn.Module):
         return loss, outputs
 
 
-
 class OptimFactory():
     def __init__(self,net,rigid_lr=True,mix_prec=False,**kwargs):
         """
@@ -133,9 +152,10 @@ class OptimFactory():
         """
         self.optimizers = []
         self.rigid_lr = rigid_lr
+        self.mix_prec = mix_prec
         self.add_optim(net,**kwargs)
         self.schedulers = []
-        self.mix_prec = mix_prec
+
 
     def lr_step(self,epoch=None,lr_decay=None):
         if self.rigid_lr: # rigid lr
@@ -159,7 +179,7 @@ class OptimFactory():
             scaled_loss.backward()
         self.step()
     def add_optim(self,
-                  net,
+                  net=None,
                   optim_name="sgd",
                   lr=0.001,
                   weight_decay=0.95,
