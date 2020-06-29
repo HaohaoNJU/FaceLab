@@ -13,6 +13,8 @@ import os
 import pdb
 import shutil
 import gc
+from easydict import EasyDict
+import yaml
 import time
 from tensorboardX import SummaryWriter
 import seaborn as sbn
@@ -52,7 +54,6 @@ class Solver(nn.Module):
         self.use_gpu = opt.use_gpu
         self.gpu_ids = [int(x) for x in opt.gpu_ids.split(",")] if isinstance(opt.gpu_ids,str)\
             else [int(x) for x in opt.gpu_ids]
-
         self.batch_size = opt.batch_size
         self.print_freq = int(opt.print_freq)
         self.val_interval = opt.val_interval
@@ -84,19 +85,30 @@ class Solver(nn.Module):
         self.build_model()
 
     def init_model(self):
+        # specify device
+        if not torch.cuda.is_available() or not self.use_gpu:
+            self.device = torch.device("cpu")
+        elif self.dist_parallel:
+            self.device = torch.device(f'cuda:{self.local_rank}')
+        else:
+            self.device = torch.device("cuda:{}".format(self.gpu_ids[0]))
         # backbone init
         self.net = self.net(**self.backbone_kwargs)
+        self.net = self.net.to(self.device)
+
         # header init
         self.header = Header(
             pairwise=self.pairwise_learning,
             net_tag=self.net_tag,
             embedding_dim=self.embedding_dim,
             num_classes=self.num_classes,
+            local_rank = self.local_rank,
             config=self.header_cfg
         )
+        self.header.to(self.device)
         # optimizer init
         self.optim_fac = OptimFactory(
-            params = self.net,
+            net = self.net,
             rigid_lr=self.rigid_lr,
             mix_prec = self.dist_parallel,
             **self.hypers
@@ -129,35 +141,30 @@ class Solver(nn.Module):
                 state_dict = torch.load(self.model_weight_path)
                 self.net.load_state_dict(state_dict)
             self.header.load()
+            self.io_fac.logging("Model Loaded from {} ".format(self.model_weight_path))
         # add params
         for module,_,_,optim_name,hypers in self.header.learnable_modules:
             self.optim_fac.add_optim(
-                params = module,
+                net = module,
                 optim_name = optim_name,
                 **hypers
             )
 
-        # cuda and parallel
-        if not torch.cuda.is_available() or not self.use_gpu:
-            self.net = self.net.cpu()
-            self.device = torch.device("cpu")
-
-        elif self.dist_parallel:
-            self.device = torch.device(f'cuda:{self.local_rank}')
-            self.net = self.net.to(self.device)
-            self.header.to(self.device)
-            self.net = convert_syncbn_model(self.net)
-            self.net = DistributedDataParallel(self.net,delay_allreduce=True)
+        # parallel
+        if self.dist_parallel:
+            # self.net = convert_syncbn_model(self.net)
+            # self.net = torch.nn.parallel.DistributedDataParallel(self.net,
+            #                                                   device_ids=[self.local_rank],
+            #                                                   output_device=self.local_rank)
+            try:
+                self.net = DistributedDataParallel(self.net,delay_allreduce=True)
+            except Exception as e:
+                print("error local rank: ",self.local_rank)
             self.header.dist_parallel()
-        elif len(self.gpu_ids) > 1:
-            self.device = torch.device("cuda:{}".format(self.gpu_ids[0]))
-            self.net = self.net.to(self.device)
-            self.header.to(self.device)
+        elif self.use_gpu and len(self.gpu_ids) > 1:
             self.net = nn.DataParallel(self.net, device_ids=self.gpu_ids)
             self.header.parallel(self.gpu_ids)
-        else:
-            self.net = nn.DataParallel(self.net,device_ids=self.gpu_ids)
-            self.header.parallel(self.gpu_ids)
+
 
     def heatmapper(self,embeddings=None,labels=None,steps=None):
         with torch.no_grad():
@@ -169,9 +176,13 @@ class Solver(nn.Module):
             sbn.heatmap(data_frame, annot=False)
             self.io_fac.writer.add_figure("heatmap", figure=fig, global_step=(steps))
 
+    def reduce_tensor(self,data):
+        rt = data.clone()
+        distributed.all_reduce(rt, op=distributed.reduce_op.SUM)
+        rt /= distributed.get_world_size()
+        return rt
     def train(self):
-        self.io_fac.logging("Model Loaded from {} ".format(self.model_weight_path))
-        steps = self.start_epoch*self.train_loader.__len__
+        steps = self.start_epoch*self.train_loader.__len__()
         self.io_fac.logging("START TRAINING!!!")
         for epoch in range(self.start_epoch,self.start_epoch+self.epoch):
             self.net.train()
@@ -196,11 +207,14 @@ class Solver(nn.Module):
                 embeddings = self.net(imgs)
                 embeddings.squeeze_()
                 (loss,outputs) = self.header(embeddings,labels)
-                loss = loss.mean()
+
                 self.optim_fac.reset()
                 if self.dist_parallel:
+                    loss_val = self.reduce_tensor(loss.data)
                     self.optim_fac.dist_step(loss)
                 else:
+                    loss = loss.mean()
+                    loss_val = loss.data.item()
                     loss.backward()
                     self.optim_fac.step()
 
@@ -210,7 +224,6 @@ class Solver(nn.Module):
                 steps += 1
                 if steps % self.print_freq == 0:
                     toc = time.time()
-                    loss_val = loss.data.item()
                     # output = torch.argmax(output.data)
                     # acc = (output==label).float().mean().data.item()*100 # scalor
                     # acc_sum += acc
@@ -237,7 +250,10 @@ class Solver(nn.Module):
                          "********EPOCH {}, LOSS_MEAN = {:.4}, ACC_MEAN = {:.3}%********".format(epoch, loss_mean, acc_mean))
             if epoch % self.val_interval == 0 or epoch == self.start_epoch + self.epoch - 1:
                 save_dir = os.path.join(self.io_fac.save_weight_path,"epoch{}_steps{}.pth".format(epoch,steps))
-                torch.save(self.net.module.state_dict(),save_dir)
+                if hasattr(self.net, "module"):
+                    torch.save(self.net.module.state_dict(), save_dir)
+                else:
+                    torch.save(self.net.state_dict(), save_dir)
                 self.io_fac.logging("Model Saved into {}".format(save_dir))
                 self.header.save(epoch,self.io_fac.save_weight_path)
                 if self.validate:
@@ -245,16 +261,17 @@ class Solver(nn.Module):
     def val(self):
         pass # Online validation is to be added !
 
-def main_worker(gpu, ngpus_per_node, opt):
+def main_worker(opt):
 
-    print("Use GPU: {} for training".format(gpu))
+    # print("Use GPU: {} for training".format(gpu))
     # For multiprocessing distributed training, rank needs to be the
     # global rank among all the processes
     # dist init
 
-    opt.local_rank = opt.local_rank * ngpus_per_node + gpu
+    # opt.local_rank = opt.local_rank * ngpus_per_node + gpu
+    torch.cuda.set_device(opt.local_rank)
     distributed.init_process_group(
-            "nccl", init_method="env://",world_size=ngpus_per_node,rank=opt.local_rank
+            "nccl", init_method="env://" #,world_size=opt.nproc_per_node,rank=opt.local_rank
         )
     # mpu.initialize_model_parallel(args.model_parallel_size)
 
@@ -262,21 +279,27 @@ def main_worker(gpu, ngpus_per_node, opt):
     solver.train()
 
 if __name__ == "__main__":
-    # https://zhuanlan.zhihu.com/p/76638962
     # get config
-    from easydict import EasyDict
-    import yaml
+    torch.backends.cudnn.benchmark=True
     args = parse_args()
     # opt = args.cfg[:-3] if args.cfg.endswith("py") else args.cfg
     # opt = get_func(opt)
     opt = EasyDict(yaml.load(open(args.cfg,"r"),Loader = yaml.Loader))
     opt.local_rank = args.local_rank
+    opt.nproc_per_node = args.nproc_per_node
     print("local rank: ",opt.local_rank)
+    print("nproc_per_node: ",opt.nproc_per_node)
     # specify gpus to use
     os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_ids
+    opt.gpu_ids = [x for x in range(len(opt.gpu_ids.split(",")))] if isinstance(opt.gpu_ids,str)\
+            else [x for x in range(len(opt.gpu_ids))]
     # initialize and run up !
-    solver = Solver(opt)
-    solver.train()
+    if opt.dist_parallel:
+        main_worker(opt)
+    else:
+        solver = Solver(opt)
+        solver.train()
+
 
 
 
