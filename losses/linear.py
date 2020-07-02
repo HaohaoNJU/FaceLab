@@ -26,14 +26,13 @@ class MetricFunc(nn.Module):
         # initial kernel
         init.xavier_uniform_(self.kernel)
         self.kernel_norm = kernel_norm
-
-    def forward(self, embbedings,label):
         # weights norm
         if self.kernel_norm:
-            kernel_norm = l2_norm(self.kernel,axis=0)
-        output = torch.mm(embbedings,kernel_norm)
+            self.kernel = l2_norm(self.kernel,axis=0)
+            
+    def forward(self, embbedings,label):
+        output = torch.mm(embbedings,self.kernel)
         return output
-
 
 
 
